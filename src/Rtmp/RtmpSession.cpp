@@ -44,19 +44,18 @@ RtmpSession::~RtmpSession() {
 }
 
 void RtmpSession::onError(const SockException& err) {
-	WarnP(this) << err.what();
+    bool isPlayer = !_pPublisherSrc;
+    WarnP(this) << (isPlayer ? "RTMP播放器(" : "RTMP推流器(")
+                << _mediaInfo._vhost << "/"
+                << _mediaInfo._app << "/"
+                << _mediaInfo._streamid
+                << ")断开:" << err.what();
 
     //流量统计事件广播
     GET_CONFIG(uint32_t,iFlowThreshold,General::kFlowThreshold);
 
     if(_ui64TotalBytes > iFlowThreshold * 1024){
-        bool isPlayer = !_pPublisherSrc;
-        NoticeCenter::Instance().emitEvent(Broadcast::kBroadcastFlowReport,
-                                           _mediaInfo,
-                                           _ui64TotalBytes,
-                                           _ticker.createdTime()/1000,
-                                           isPlayer,
-                                           *this);
+        NoticeCenter::Instance().emitEvent(Broadcast::kBroadcastFlowReport, _mediaInfo, _ui64TotalBytes, _ticker.createdTime()/1000, isPlayer);
     }
 }
 
@@ -165,7 +164,7 @@ void RtmpSession::onCmd_publish(AMFDecoder &dec) {
             shutdown(SockException(Err_shutdown,errMsg));
             return;
         }
-        _pPublisherSrc.reset(new RtmpToRtspMediaSource(_mediaInfo._vhost,_mediaInfo._app,_mediaInfo._streamid));
+        _pPublisherSrc.reset(new RtmpMediaSourceImp(_mediaInfo._vhost,_mediaInfo._app,_mediaInfo._streamid));
         _pPublisherSrc->setListener(dynamic_pointer_cast<MediaSourceEvent>(shared_from_this()));
         //设置转协议
         _pPublisherSrc->setProtocolTranslation(enableRtxp,enableHls,enableMP4);
@@ -194,7 +193,10 @@ void RtmpSession::onCmd_publish(AMFDecoder &dec) {
                                                    *this);
     if(!flag){
         //该事件无人监听，默认鉴权成功
-        onRes("",true,true,false);
+        GET_CONFIG(bool,toRtxp,General::kPublishToRtxp);
+        GET_CONFIG(bool,toHls,General::kPublishToHls);
+        GET_CONFIG(bool,toMP4,General::kPublishToMP4);
+        onRes("",toRtxp,toHls,toMP4);
     }
 }
 
@@ -295,7 +297,7 @@ void RtmpSession::sendPlayResponse(const string &err,const RtmpMediaSource::Ptr 
         strongSelf->shutdown(SockException(Err_shutdown,"rtmp ring buffer detached"));
     });
     _pPlayerSrc = src;
-    if (src->readerCount() == 1) {
+    if (src->totalReaderCount() == 1) {
         src->seekTo(0);
     }
     //提高服务器发送性能
@@ -312,7 +314,7 @@ void RtmpSession::doPlayResponse(const string &err,const std::function<void(bool
 
     //鉴权成功，查找媒体源并回复
     weak_ptr<RtmpSession> weakSelf = dynamic_pointer_cast<RtmpSession>(shared_from_this());
-    MediaSource::findAsync(_mediaInfo,weakSelf.lock(), true,[weakSelf,cb](const MediaSource::Ptr &src){
+    MediaSource::findAsync(_mediaInfo,weakSelf.lock(),[weakSelf,cb](const MediaSource::Ptr &src){
         auto rtmp_src = dynamic_pointer_cast<RtmpMediaSource>(src);
         auto strongSelf = weakSelf.lock();
         if(strongSelf){
@@ -430,9 +432,8 @@ void RtmpSession::setMetaData(AMFDecoder &dec) {
 		throw std::runtime_error("can only set metadata");
 	}
     auto metadata = dec.load<AMFValue>();
-    //dumpMetadata(metadata);
-    _metadata_got = true;
-	_pPublisherSrc->onGetMetaData(metadata);
+//    dumpMetadata(metadata);
+    _pPublisherSrc->setMetaData(metadata);
 }
 
 void RtmpSession::onProcessCmd(AMFDecoder &dec) {
@@ -486,13 +487,8 @@ void RtmpSession::onRtmpChunk(RtmpPacket &chunkData) {
 		GET_CONFIG(bool,rtmp_modify_stamp,Rtmp::kModifyStamp);
         if(rtmp_modify_stamp){
             int64_t dts_out;
-            _stamp[chunkData.typeId % 2].revise(0, 0, dts_out, dts_out);
+            _stamp[chunkData.typeId % 2].revise(chunkData.timeStamp, chunkData.timeStamp, dts_out, dts_out, true);
             chunkData.timeStamp = dts_out;
-        }
-        if(!_metadata_got && !chunkData.isCfgFrame()){
-            //有些rtmp推流客户端不产生metadata，我们产生一个默认的metadata，目的是为了触发注册操作
-            _metadata_got = true;
-            _pPublisherSrc->onGetMetaData(TitleMeta().getMetadata());
         }
         _pPublisherSrc->onWrite(std::make_shared<RtmpPacket>(std::move(chunkData)));
 	}
@@ -531,7 +527,7 @@ void RtmpSession::onSendMedia(const RtmpPacket::Ptr &pkt) {
 
 bool RtmpSession::close(MediaSource &sender,bool force)  {
     //此回调在其他线程触发
-    if(!_pPublisherSrc || (!force && _pPublisherSrc->readerCount() != 0)){
+    if(!_pPublisherSrc || (!force && _pPublisherSrc->totalReaderCount())){
         return false;
     }
     string err = StrPrinter << "close media:" << sender.getSchema() << "/" << sender.getVhost() << "/" << sender.getApp() << "/" << sender.getId() << " " << force;
@@ -541,10 +537,14 @@ bool RtmpSession::close(MediaSource &sender,bool force)  {
 
 void RtmpSession::onNoneReader(MediaSource &sender) {
     //此回调在其他线程触发
-    if(!_pPublisherSrc || _pPublisherSrc->readerCount() != 0){
+    if(!_pPublisherSrc || _pPublisherSrc->totalReaderCount()){
         return;
     }
     MediaSourceEvent::onNoneReader(sender);
+}
+
+int RtmpSession::totalReaderCount(MediaSource &sender) {
+    return _pPublisherSrc ? _pPublisherSrc->totalReaderCount() : sender.readerCount();
 }
 
 void RtmpSession::setSocketFlags(){

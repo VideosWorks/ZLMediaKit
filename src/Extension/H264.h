@@ -49,7 +49,6 @@ public:
         NAL_SPS = 7,
         NAL_PPS = 8,
         NAL_IDR = 5,
-        NAL_B_P = 1
     } NalType;
 
     char *data() const override{
@@ -315,18 +314,15 @@ private:
                 //I
                 insertConfigFrame(frame);
                 VideoTrack::inputFrame(frame);
-                _last_frame_is_idr = true;
             }
                 break;
 
-            case H264Frame::NAL_B_P:{
-                //B or P
+            default:
                 VideoTrack::inputFrame(frame);
-                _last_frame_is_idr = false;
-            }
                 break;
         }
 
+        _last_frame_is_idr = type == H264Frame::NAL_IDR;
         if(_width == 0 && ready()){
             onReady();
         }
@@ -390,7 +386,7 @@ public:
         _printer << "m=video 0 RTP/AVP " << playload_type << "\r\n";
         _printer << "b=AS:" << bitrate << "\r\n";
         _printer << "a=rtpmap:" << playload_type << " H264/" << 90000 << "\r\n";
-        _printer << "a=fmtp:" << playload_type << " packetization-mode=1;profile-level-id=";
+        _printer << "a=fmtp:" << playload_type << " packetization-mode=1; profile-level-id=";
 
         char strTemp[100];
         uint32_t profile_level_id = 0;
@@ -402,7 +398,7 @@ public:
         memset(strTemp, 0, 100);
         sprintf(strTemp, "%06X", profile_level_id);
         _printer << strTemp;
-        _printer << ";sprop-parameter-sets=";
+        _printer << "; sprop-parameter-sets=";
         memset(strTemp, 0, 100);
         av_base64_encode(strTemp, 100, (uint8_t *) strSPS.data(), strSPS.size());
         _printer << strTemp << ",";

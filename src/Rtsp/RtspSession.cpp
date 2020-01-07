@@ -85,7 +85,13 @@ RtspSession::~RtspSession() {
 }
 
 void RtspSession::onError(const SockException& err) {
-	WarnP(this) << err.what();
+    bool isPlayer = !_pushSrc;
+    WarnP(this) << (isPlayer ? "RTSP播放器(" : "RTSP推流器(")
+                << _mediaInfo._vhost << "/"
+                << _mediaInfo._app << "/"
+                << _mediaInfo._streamid
+                << ")断开:" << err.what();
+
 	if (_rtpType == Rtsp::RTP_MULTICAST) {
 		//取消UDP端口监听
 		UDPServer::Instance().stopListenPeer(get_peer_ip().data(), this);
@@ -100,13 +106,7 @@ void RtspSession::onError(const SockException& err) {
     //流量统计事件广播
     GET_CONFIG(uint32_t,iFlowThreshold,General::kFlowThreshold);
     if(_ui64TotalBytes > iFlowThreshold * 1024){
-        bool isPlayer = !_pushSrc;
-        NoticeCenter::Instance().emitEvent(Broadcast::kBroadcastFlowReport,
-										   _mediaInfo,
-										   _ui64TotalBytes,
-										   _ticker.createdTime()/1000,
-                                           isPlayer,
-										   *this);
+        NoticeCenter::Instance().emitEvent(Broadcast::kBroadcastFlowReport, _mediaInfo, _ui64TotalBytes, _ticker.createdTime()/1000, isPlayer);
     }
 
 }
@@ -258,9 +258,9 @@ void RtspSession::handleReq_ANNOUNCE(const Parser &parser) {
     _strSession = makeRandStr(12);
     _aTrackInfo = sdpParser.getAvailableTrack();
 
-	_pushSrc = std::make_shared<RtspToRtmpMediaSource>(_mediaInfo._vhost,_mediaInfo._app,_mediaInfo._streamid);
+	_pushSrc = std::make_shared<RtspMediaSourceImp>(_mediaInfo._vhost,_mediaInfo._app,_mediaInfo._streamid);
 	_pushSrc->setListener(dynamic_pointer_cast<MediaSourceEvent>(shared_from_this()));
-	_pushSrc->onGetSDP(sdpParser.toString());
+    _pushSrc->setSdp(sdpParser.toString());
 
 	sendRtspResponse("200 OK",{"Content-Base",_strContentBase + "/"});
 }
@@ -319,8 +319,11 @@ void RtspSession::handleReq_RECORD(const Parser &parser){
 	auto flag = NoticeCenter::Instance().emitEvent(Broadcast::kBroadcastMediaPublish,_mediaInfo,invoker,*this);
 	if(!flag){
 		//该事件无人监听,默认不鉴权
-		onRes("",true,true,false);
-	}
+        GET_CONFIG(bool,toRtxp,General::kPublishToRtxp);
+        GET_CONFIG(bool,toHls,General::kPublishToHls);
+        GET_CONFIG(bool,toMP4,General::kPublishToMP4);
+        onRes("",toRtxp,toHls,toMP4);
+    }
 }
 
 void RtspSession::handleReq_Describe(const Parser &parser) {
@@ -363,7 +366,7 @@ void RtspSession::handleReq_Describe(const Parser &parser) {
 void RtspSession::onAuthSuccess() {
     TraceP(this);
     weak_ptr<RtspSession> weakSelf = dynamic_pointer_cast<RtspSession>(shared_from_this());
-    MediaSource::findAsync(_mediaInfo,weakSelf.lock(), true,[weakSelf](const MediaSource::Ptr &src){
+    MediaSource::findAsync(_mediaInfo,weakSelf.lock(),[weakSelf](const MediaSource::Ptr &src){
         auto strongSelf = weakSelf.lock();
         if(!strongSelf){
             return;
@@ -765,7 +768,7 @@ void RtspSession::handleReq_Play(const Parser &parser) {
 			auto iStartTime = 1000 * atof(strStart.data());
 			InfoP(this) << "rtsp seekTo(ms):" << iStartTime;
 			useBuf = !pMediaSrc->seekTo(iStartTime);
-		}else if(pMediaSrc->readerCount() == 0){
+		}else if(pMediaSrc->totalReaderCount() == 0){
 			//第一个消费者
 			pMediaSrc->seekTo(0);
 		}
@@ -932,7 +935,7 @@ void RtspSession::onRtpSorted(const RtpPacket::Ptr &rtppt, int trackidx) {
     GET_CONFIG(bool,modify_stamp,Rtsp::kModifyStamp);
     if(modify_stamp){
         int64_t dts_out;
-        _stamp[trackidx].revise(0, 0, dts_out, dts_out);
+        _stamp[trackidx].revise(rtppt->timeStamp, rtppt->timeStamp, dts_out, dts_out, true);
         rtppt->timeStamp = dts_out;
     }
 	_pushSrc->onWrite(rtppt, false);
@@ -1097,6 +1100,9 @@ inline int RtspSession::getTrackIndexByTrackType(TrackType type) {
 			return i;
 		}
 	}
+    if(_aTrackInfo.size() == 1){
+        return 0;
+    }
 	return -1;
 }
 inline int RtspSession::getTrackIndexByControlSuffix(const string &controlSuffix) {
@@ -1117,12 +1123,15 @@ inline int RtspSession::getTrackIndexByInterleaved(int interleaved){
 			return i;
 		}
 	}
+    if(_aTrackInfo.size() == 1){
+        return 0;
+    }
 	return -1;
 }
 
 bool RtspSession::close(MediaSource &sender,bool force) {
     //此回调在其他线程触发
-    if(!_pushSrc || (!force && _pushSrc->readerCount() != 0)){
+    if(!_pushSrc || (!force && _pushSrc->totalReaderCount())){
         return false;
     }
 	string err = StrPrinter << "close media:" << sender.getSchema() << "/" << sender.getVhost() << "/" << sender.getApp() << "/" << sender.getId() << " " << force;
@@ -1133,12 +1142,15 @@ bool RtspSession::close(MediaSource &sender,bool force) {
 
 void RtspSession::onNoneReader(MediaSource &sender){
     //此回调在其他线程触发
-    if(!_pushSrc || _pushSrc->readerCount() != 0){
+    if(!_pushSrc || _pushSrc->totalReaderCount()){
         return;
     }
     MediaSourceEvent::onNoneReader(sender);
 }
 
+int RtspSession::totalReaderCount(MediaSource &sender) {
+    return _pushSrc ? _pushSrc->totalReaderCount() : sender.readerCount();
+}
 
 void RtspSession::sendRtpPacket(const RtpPacket::Ptr & pkt) {
     //InfoP(this) <<(int)pkt.Interleaved;
